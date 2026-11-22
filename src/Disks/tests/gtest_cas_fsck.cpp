@@ -4562,6 +4562,80 @@ TEST(CASFsckPartial, DeadlineReturnsAccumulatedCountsInsteadOfThrowing)
     EXPECT_FALSE(report.partial_reason.empty());
 }
 
+/// A scan cut short by its deadline has checked only part of the pool, so it cannot be a clean verdict.
+TEST(CASFsckPartial, DeadlineWithNoFindingIsNotClean)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
+
+    const ToolDeadline past = fsckDeadlineIn(*store, std::chrono::milliseconds(0));
+    const auto report = DB::Cas::runFsck(*store, false, {}, past, /*partial_on_deadline=*/true);
+
+    ASSERT_TRUE(report.partial);
+    for (const FsckHardFinding & finding : kFsckHardFindings)
+        EXPECT_EQ(report.*finding.value, 0u) << finding.name;
+    EXPECT_FALSE(report.clean());
+}
+
+/// A finding recorded before the cut stays in the report, and the line carries both facts.
+TEST(CASFsckPartial, FindingRecordedBeforeTheCutIsReportedAndNotClean)
+{
+    FsckGcFixture f(/*create_budget=*/0, {1, 2, 3, 4});
+    f.drop();
+    f.round();
+    const String lifeless = f.store->layout().casRefsPrefix() + f.ns.string() + "/_log/"
+        + renderRefTxnId(RefTxnId{1, 1}) + ".zst";
+    {
+        OperationForTest op(*f.backend);
+        ASSERT_TRUE(std::holds_alternative<Committed>((*op).create(lifeless, "garbage", Retry::once())));
+    }
+    const auto clock = VirtualRetryClock::installOn(f.store);
+    const ToolDeadline deadline = fsckDeadlineIn(*f.store, std::chrono::seconds(1));
+    for (const uint64_t b : {1, 2, 3, 4})
+        f.backend->beforeHead(f.bodyKey(b), [clock] { clock->advance(2000); });
+
+    const FsckReport rep = runFsck(*f.store, /*detail=*/true, {}, deadline, /*partial_on_deadline=*/true);
+
+    ASSERT_TRUE(rep.partial);
+    EXPECT_NE(rep.partial_reason.find("checking pending rows"), String::npos) << rep.partial_reason;
+    EXPECT_EQ(rep.lifeless_keys, 1u);
+    size_t rows = 0;
+    for (const FsckObject & o : rep.objects)
+        if (o.cls == FsckClass::LifelessKey)
+            ++rows;
+    EXPECT_EQ(rows, 1u);
+    EXPECT_FALSE(rep.clean());
+    const String line = formatFsckSummary(rep);
+    EXPECT_NE(line.find("lifeless_keys=1"), String::npos) << line;
+    EXPECT_NE(line.find("partial=1"), String::npos) << line;
+}
+
+/// A deadline that is not reached leaves the report clean: `clean` does not depend on a deadline existing.
+TEST(CASFsckPartial, CompleteScanWithADeadlineIsClean)
+{
+    auto backend = std::make_shared<InMemoryBackend>();
+    auto store = openPoolForTest(backend);
+    const RootNamespace ns{"00/aa@cas@"};
+    const ManifestRef r = ref(1, 0xAA);
+    writeBlobBody(*backend, store->layout(), DB::UInt128(1));
+    writeManifestRaw(*backend, store->layout(), ns, r, {blobEntryFor("a", DB::UInt128(1))});
+    const uint64_t sequence = publishCommittedTransition(*backend, store->layout(), ns, "tbl", std::nullopt, r);
+    writeFsckCheckpoint(*backend, store->layout(), ns, RefTxnId{1, sequence});
+
+    const ToolDeadline later = fsckDeadlineIn(*store, std::chrono::hours(1));
+    const auto report = DB::Cas::runFsck(*store, false, {}, later, /*partial_on_deadline=*/true);
+
+    EXPECT_FALSE(report.partial);
+    EXPECT_TRUE(report.clean());
+    EXPECT_EQ(formatFsckSummary(report).find("partial="), String::npos);
+}
+
 /// A `namespace_prefix` scopes the scan to only the matching namespaces' refs (dangling-only): no
 /// pool-wide unreachable/pending/awaiting/unaccounted classification, since that needs the whole pool.
 TEST(CASFsckScoped, NamespacePrefixChecksOnlyMatchingRefsDanglingOnly)
@@ -4872,6 +4946,13 @@ TEST(CASFsckSummary, AdvisoryIntentCountersAndTheVerificationFlagArePrinted)
     EXPECT_NE(verified.find("intents_listed=5"), String::npos) << verified;
     EXPECT_NE(verified.find("standing_present=2"), String::npos) << verified;
     EXPECT_TRUE(report.clean()) << "the advisory counters never make a report unclean";
+}
+
+/// Pins the exact token order and set of a complete clean line, which scripts parse by key.
+TEST(CASFsckSummary, CompleteCleanLineIsUnchanged)
+{
+    EXPECT_EQ(formatFsckSummary(FsckReport{}), 
+        "reachable=0 dangling=0 unreachable=0 pending_gc=0 awaiting_gc=0 unaccounted=0 stale_edge=0 stale_edge_superseded=0 corrupted_runs=0 chain_broken=0 lifeless_keys=0 intents_listed=0 intent_current=0 intent_replaced=0 intent_body_gone=0 intent_malformed=0 intent_unread=0 pending_without_intent=0 pending_intent_absent=0 pending_token_rejected=0 standing_present=0 intents_verified=0 legacy_marker=0 legacy_markers_deleted=0 legacy_markers_changed=0 janitor_pending=0 janitor_pending_bytes=0 janitor_pending_lives=0 stalled_creating=0 creating_unproven=0 unchecked=0 ref_records_walked=0 physical_bytes=0 referenced_logical_bytes=0 distinct_blobs=0 total_blob_refs=0 dedup_ratio=0");
 }
 
 TEST(CASFsckSummary, PartialFlagAndReasonTravelWithTheCounts)
